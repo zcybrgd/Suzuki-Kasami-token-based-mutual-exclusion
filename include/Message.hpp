@@ -8,7 +8,7 @@ enum MessageType {
  TOKEN, //envoi du token au processus demandant
  STATUS_UPDATE, // we'll need it later for frontend
 
-}
+};
 
 
 struct Message {
@@ -16,4 +16,4 @@ struct Message {
   int sender;
   int clock; // horloge logique de lamport
   vector<int> token;
-}
+};

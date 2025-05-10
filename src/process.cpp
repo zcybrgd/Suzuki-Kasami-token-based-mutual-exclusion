@@ -1,540 +1,278 @@
-class Process {
-private:
-    int id;                             // ID du processus (de 1 à N)
-    atomic<int> clock;                  // Horloge logique
-    atomic<bool> hasToken;              // Possession du jeton
-    atomic<ProcessState> state;         // État du processus
-    vector<int> token;                  // Tableau du jeton
-    vector<int> requests;               // Tableau des requêtes
-    atomic<bool> inCS;                  // Dans la section critique
-    
-    // Sockets et communication
-    int serverSocket;                   // Socket serveur
-    map<int, int> clientSockets;        // Sockets clients
-    thread serverThread;                // Thread serveur
-    thread mainProcessThread;           // Thread principal du processus
-    
-    // Variables de synchronisation
-    mutex tokenMutex;                   // Mutex pour protéger le jeton
-    condition_variable tokenCV;         // Variable de condition pour l'attente du jeton
-    
-    // Socket pour l'UI Web
-    int webSocketServer;
-    vector<int> webClients;
-    thread webSocketThread;
-    
-    // État pour l'interface graphique
-    json uiState;
-    mutex uiStateMutex;
-    
-    // Générateur de nombres aléatoires
-    mt19937 rng;
-    
-public:
-    Process(int id, bool initialToken = false) : 
-        id(id), 
-        clock(0), 
-        hasToken(initialToken), 
-        state(IDLE),
-        inCS(false) {
-        
-        // Initialisation des tableaux
-        token.resize(NUM_PROCESSES, 0);
-        requests.resize(NUM_PROCESSES, 0);
-        
-        // Initialisation du générateur aléatoire
-        random_device rd;
-        rng = mt19937(rd());
-        
-        // Initialisation de l'état UI
-        updateUIState();
+#include "Process.hpp"
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <random>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <cstring>
+#include <algorithm>
+
+using namespace std;
+
+//constructeur
+Process::Process(int id, bool initialToken)
+  : id(id)
+  , horlogelogique(0)
+  , jetonpresent(initialToken)
+  , state(IDLE)
+  , dedans(false)
+  , enpanne(false)
+{
+    jeton    = vector<int>(NUM_PROCESS, 0);
+    requetes = vector<int>(NUM_PROCESS, 0);
+    cout << "Processus " << id
+         << " créé" << (initialToken ? " avec jeton initial" : "") << endl;
+}
+
+//destructor for proper and gracefully stopping
+Process::~Process() {
+    stop();
+}
+
+//démarrage des threads du processus
+void Process::start() {
+    serverThread      = thread(&Process::runServer, this);
+    mainProcessThread = thread(&Process::run,       this);
+}
+
+// Arrêt du processus et nettoyage
+void Process::stop() {
+    // signaler fin aux boucles
+    enpanne = true;
+    tokenCV.notify_all();
+    shutdown(serverSocket, SHUT_RDWR);
+
+    if (serverThread.joinable())      serverThread.join();
+    if (mainProcessThread.joinable()) mainProcessThread.join();
+
+    close(serverSocket);
+    for (auto &p : clientSockets) close(p.second);
+}
+
+// Simulation d'une panne
+void Process::fail() {
+    enpanne = true;
+    updateState(FAILED);
+    cout << "Processus " << id << " en panne" << endl;
+}
+
+// Récupération après une panne
+void Process::recover() {
+    enpanne = false;
+    updateState(IDLE);
+    cout << "Processus " << id << " récupéré" << endl;
+}
+
+// Méthode principale du processus
+void Process::run() {
+    this_thread::sleep_for(chrono::seconds(3));
+    connectToOtherProcesses();
+    this_thread::sleep_for(chrono::seconds(2));
+
+    mt19937 rng(random_device{}());
+    uniform_int_distribution<> waitDist(1, 5);
+    uniform_int_distribution<> csDist(1, 2);
+
+    while (!enpanne) {
+        int waitTime = waitDist(rng);
+        cout << "Processus " << id << " attend " << waitTime << " secondes" << endl;
+        this_thread::sleep_for(chrono::seconds(waitTime));
+
+        if (enpanne) continue;
+
+        demandeSC();
+        entrerSC();
+
+        int csTime = csDist(rng);
+        cout << "Processus " << id << " est en SC pendant " << csTime << " secondes" << endl;
+        this_thread::sleep_for(chrono::seconds(csTime));
+
+        quitterSC();
     }
-    
-    ~Process() {
-        stop();
+}
+
+// Demande d'accès à la section critique
+void Process::demandeSC() {
+    lock_guard<mutex> lock(tokenMutex);
+
+    if (jetonpresent) {
+        cout << "Processus " << id << " a déjà le jeton, pas besoin de le demander" << endl;
+        return;
     }
-    
-    // Démarrage du processus
-    void start() {
-        // Démarrage du serveur de socket
-        serverThread = thread(&Process::runServer, this);
-        
-        // Démarrage du serveur websocket pour l'UI
-        webSocketThread = thread(&Process::runWebSocketServer, this);
-        
-        // Attente pour s'assurer que tous les serveurs sont démarrés
-        this_thread::sleep_for(chrono::seconds(2));
-        
-        // Connexion aux autres processus
-        connectToOtherProcesses();
-        
-        // Démarrage du thread principal
-        mainProcessThread = thread(&Process::run, this);
-    }
-    
-    // Arrêt du processus
-    void stop() {
-        // Fermeture des sockets
-        close(serverSocket);
-        for (auto& socket : clientSockets) {
-            close(socket.second);
-        }
-        close(webSocketServer);
-        
-        // Attente de la fin des threads
-        if (serverThread.joinable()) serverThread.join();
-        if (mainProcessThread.joinable()) mainProcessThread.join();
-        if (webSocketThread.joinable()) webSocketThread.join();
-    }
-    
-    // Simuler une panne
-    void fail() {
-        state = FAILED;
-        updateUIState();
-    }
-    
-    // Récupérer d'une panne
-    void recover() {
-        state = IDLE;
-        updateUIState();
-    }
-    
-private:
-    // Boucle principale du processus
-    void run() {
-        while (true) {
-            if (state != FAILED) {
-                // Attente aléatoire avant de demander la section critique
-                int waitTime = getRandomTime(1000, 5000);
-                this_thread::sleep_for(chrono::milliseconds(waitTime));
-                
-                // Demande de section critique
-                requestCriticalSection();
-                
-                // Exécution de la section critique
-                int csTime = getRandomTime(1000, 2000);
-                this_thread::sleep_for(chrono::milliseconds(csTime));
-                
-                // Sortie de la section critique
-                exitCriticalSection();
-            } else {
-                // En panne, on attend
-                this_thread::sleep_for(chrono::milliseconds(1000));
-            }
-        }
-    }
-    
-    // Algorithme de Ricart & Agrawala pour demander la section critique
-    void requestCriticalSection() {
-        if (state == FAILED) return;
-        
-        state = REQUESTING;
-        updateUIState();
-        
-        // Incrémentation de l'horloge
-        clock++;
-        
-        // Si on a déjà le jeton, on entre directement en section critique
-        {
-            unique_lock<mutex> lock(tokenMutex);
-            if (hasToken) {
-                enterCriticalSection();
-                return;
-            }
-        }
-        
-        // Diffusion de la requête à tous les autres processus
-        Message msg;
-        msg.type = REQUEST;
-        msg.sender = id;
-        msg.clock = clock;
-        
-        broadcastMessage(msg);
-        
-        // Attente du jeton
-        {
-            unique_lock<mutex> lock(tokenMutex);
-            tokenCV.wait(lock, [this] { return hasToken || state == FAILED; });
-            
-            if (state != FAILED) {
-                enterCriticalSection();
-            }
-        }
-    }
-    
-    // Entrée en section critique
-    void enterCriticalSection() {
-        inCS = true;
-        state = IN_CS;
-        updateUIState();
-    }
-    
-    // Sortie de la section critique
-    void exitCriticalSection() {
-        if (state == FAILED) return;
-        
-        inCS = false;
-        state = IDLE;
-        
-        // Mise à jour du jeton
-        token[id-1] = clock;
-        
-        // Recherche du prochain processus à qui envoyer le jeton
-        unique_lock<mutex> lock(tokenMutex);
-        
-        for (int j = id; j <= NUM_PROCESSES + id - 1; j++) {
-            int nextProc = ((j - 1) % NUM_PROCESSES) + 1;
-            if (nextProc != id && requests[nextProc-1] > token[nextProc-1]) {
-                // Envoi du jeton au processus suivant
-                hasToken = false;
-                
-                Message msg;
-                msg.type = TOKEN;
-                msg.sender = id;
-                msg.token = token;
-                
-                sendMessage(nextProc, msg);
-                break;
-            }
-        }
-        
-        updateUIState();
-    }
-    
-    // Traitement des messages reçus
-    void handleMessage(const Message& msg) {
-        if (state == FAILED) return;
-        
-        switch (msg.type) {
-            case REQUEST: {
-                // Mise à jour du tableau des requêtes
-                requests[msg.sender-1] = max(requests[msg.sender-1], msg.clock);
-                
-                // Si on a le jeton et qu'on n'est pas en section critique, on le transmet
-                unique_lock<mutex> lock(tokenMutex);
-                if (hasToken && !inCS) {
-                    if (requests[msg.sender-1] > token[msg.sender-1]) {
-                        hasToken = false;
-                        
-                        Message tokenMsg;
-                        tokenMsg.type = TOKEN;
-                        tokenMsg.sender = id;
-                        tokenMsg.token = token;
-                        
-                        sendMessage(msg.sender, tokenMsg);
-                    }
-                }
-                break;
-            }
-            case TOKEN: {
-                // Réception du jeton
-                unique_lock<mutex> lock(tokenMutex);
-                token = msg.token;
-                hasToken = true;
-                
-                // Notification de la réception du jeton
-                tokenCV.notify_one();
-                break;
-            }
-            default:
-                break;
-        }
-        
-        updateUIState();
-    }
-    
-    // Démarrage du serveur socket
-    void runServer() {
-        serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-        
-        if (serverSocket < 0) {
-            cerr << "Erreur lors de la création du socket serveur pour le processus " << id << endl;
+
+    horlogelogique++;
+    requetes[id] = horlogelogique;
+
+    updateState(REQUESTING);
+    cout << "Processus " << id << " demande la SC avec horloge=" << horlogelogique << endl;
+
+    Message msg{REQUEST, id, horlogelogique, {}};
+    broadcastMessage(msg);
+
+    unique_lock<mutex> waitLock(tokenMutex);
+    tokenCV.wait(waitLock, [&]{ return jetonpresent.load() || enpanne.load(); });
+}
+
+// Entrée en section critique
+void Process::entrerSC() {
+    dedans = true;
+    updateState(IN_CS);
+    cout << "Processus " << id << " entre en SC" << endl;
+}
+
+// Sortie de section critique
+void Process::quitterSC() {
+    dedans = false;
+    jeton[id] = horlogelogique;
+
+    updateState(IDLE);
+    cout << "Processus " << id << " sort de SC" << endl;
+
+    for (int j = (id+1)%NUM_PROCESS; j != id; j = (j+1)%NUM_PROCESS) {
+        if (requetes[j] > jeton[j]) {
+            cout << "Processus " << id << " envoie le jeton au processus " << j << endl;
+            jetonpresent = false;
+            Message m{TOKEN, id, horlogelogique, jeton};
+            envoiMessage(j, m);
             return;
         }
-        
-        // Réutilisation de l'adresse
-        int opt = 1;
-        setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
-        // Configuration de l'adresse du serveur
-        struct sockaddr_in serverAddr;
-        memset(&serverAddr, 0, sizeof(serverAddr));
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        serverAddr.sin_port = htons(BASE_PORT + id);
-        
-        if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            cerr << "Erreur lors du bind du socket serveur pour le processus " << id << endl;
-            close(serverSocket);
-            return;
-        }
-        
-        if (listen(serverSocket, NUM_PROCESSES) < 0) {
-            cerr << "Erreur lors de l'écoute du socket serveur pour le processus " << id << endl;
-            close(serverSocket);
-            return;
-        }
-        
-        cout << "Processus " << id << " écoute sur le port " << (BASE_PORT + id) << endl;
-        
-        // Boucle d'acceptation des connexions
-        while (true) {
-            struct sockaddr_in clientAddr;
-            socklen_t clientAddrLen = sizeof(clientAddr);
-            
-            int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
-            
-            if (clientSocket < 0) {
-                cerr << "Erreur lors de l'acceptation d'une connexion pour le processus " << id << endl;
-                continue;
-            }
-            
-            // Lecture de l'ID du processus client
-            int clientId;
-            if (recv(clientSocket, &clientId, sizeof(clientId), 0) != sizeof(clientId)) {
-                close(clientSocket);
-                continue;
-            }
-            
-            // Enregistrement du socket client
-            clientSockets[clientId] = clientSocket;
-            
-            // Démarrage d'un thread pour gérer cette connexion
-            thread([this, clientSocket, clientId]() {
-                handleClientConnection(clientSocket, clientId);
-            }).detach();
-        }
     }
-    
-    // Gestion d'une connexion client
-    void handleClientConnection(int clientSocket, int clientId) {
-        while (true) {
-            // Lecture du type de message
-            MessageType type;
-            if (recv(clientSocket, &type, sizeof(type), 0) != sizeof(type)) {
-                break;
-            }
-            
-            // Lecture de l'expéditeur
-            int sender;
-            if (recv(clientSocket, &sender, sizeof(sender), 0) != sizeof(sender)) {
-                break;
-            }
-            
-            // Lecture de l'horloge
-            int msgClock;
-            if (recv(clientSocket, &msgClock, sizeof(msgClock), 0) != sizeof(msgClock)) {
-                break;
-            }
-            
-            Message msg;
-            msg.type = type;
-            msg.sender = sender;
-            msg.clock = msgClock;
-            
-            // Si c'est un message TOKEN, lire le vecteur token
-            if (type == TOKEN) {
-                msg.token.resize(NUM_PROCESSES);
-                if (recv(clientSocket, msg.token.data(), sizeof(int) * NUM_PROCESSES, 0) != sizeof(int) * NUM_PROCESSES) {
-                    break;
-                }
-            }
-            
-            // Traitement du message
-            handleMessage(msg);
-        }
-        
-        // Fermeture du socket
-        close(clientSocket);
-        clientSockets.erase(clientId);
-    }
-    
-    // Connexion aux autres processus
-    void connectToOtherProcesses() {
-        for (int i = 1; i <= NUM_PROCESSES; i++) {
-            if (i == id) continue;  // On ne se connecte pas à soi-même
-            
-            int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-            
-            if (clientSocket < 0) {
-                cerr << "Erreur lors de la création du socket client pour le processus " << id << endl;
-                continue;
-            }
-            
-            struct sockaddr_in serverAddr;
-            memset(&serverAddr, 0, sizeof(serverAddr));
-            serverAddr.sin_family = AF_INET;
-            serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-            serverAddr.sin_port = htons(BASE_PORT + i);
-            
-            // Tentative de connexion avec retries
-            for (int retry = 0; retry < 5; retry++) {
-                if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == 0) {
-                    // Envoi de notre ID
-                    send(clientSocket, &id, sizeof(id), 0);
-                    
-                    // Enregistrement du socket
-                    clientSockets[i] = clientSocket;
-                    break;
-                }
-                
-                // Attente avant de réessayer
-                this_thread::sleep_for(chrono::milliseconds(500));
-            }
-            
-            if (clientSockets.find(i) == clientSockets.end()) {
-                close(clientSocket);
-            }
-        }
-    }
-    
-    // Envoi d'un message à un processus spécifique
-    void sendMessage(int destId, const Message& msg) {
-        if (clientSockets.find(destId) == clientSockets.end()) {
-            cerr << "Processus " << id << " : Pas de connexion au processus " << destId << endl;
-            return;
-        }
-        
-        int socket = clientSockets[destId];
-        
-        // Envoi du type de message
-        send(socket, &msg.type, sizeof(msg.type), 0);
-        
-        // Envoi de l'expéditeur
-        send(socket, &msg.sender, sizeof(msg.sender), 0);
-        
-        // Envoi de l'horloge
-        send(socket, &msg.clock, sizeof(msg.clock), 0);
-        
-        // Si c'est un message TOKEN, envoyer le vecteur token
-        if (msg.type == TOKEN) {
-            send(socket, msg.token.data(), sizeof(int) * NUM_PROCESSES, 0);
-        }
-    }
-    
-    // Diffusion d'un message à tous les processus
-    void broadcastMessage(const Message& msg) {
-        for (int i = 1; i <= NUM_PROCESSES; i++) {
-            if (i != id) {  // Ne pas s'envoyer à soi-même
-                sendMessage(i, msg);
-            }
-        }
-    }
-    
-    // Génération d'un temps aléatoire
-    int getRandomTime(int min, int max) {
-        uniform_int_distribution<int> dist(min, max);
-        return dist(rng);
-    }
-    
-    // Mise à jour de l'état pour l'UI
-    void updateUIState() {
-        lock_guard<mutex> lock(uiStateMutex);
-        
-        uiState["id"] = id;
-        uiState["clock"] = clock.load();
-        uiState["hasToken"] = hasToken.load();
-        
-        string stateStr;
-        switch (state) {
-            case IDLE: stateStr = "IDLE"; break;
-            case REQUESTING: stateStr = "REQUESTING"; break;
-            case IN_CS: stateStr = "IN_CS"; break;
-            case FAILED: stateStr = "FAILED"; break;
-        }
-        uiState["state"] = stateStr;
-        
-        uiState["token"] = token;
-        uiState["requests"] = requests;
-        
-        // Diffusion de l'état à tous les clients web
-        string jsonStr = uiState.dump();
-        for (int client : webClients) {
-            send(client, jsonStr.c_str(), jsonStr.length(), 0);
-        }
-    }
-    
-    // Serveur pour l'interface web
-    void runWebSocketServer() {
-        webSocketServer = socket(AF_INET, SOCK_STREAM, 0);
-        
-        if (webSocketServer < 0) {
-            cerr << "Erreur lors de la création du socket web pour le processus " << id << endl;
-            return;
-        }
-        
-        // Réutilisation de l'adresse
-        int opt = 1;
-        setsockopt(webSocketServer, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
-        // Configuration de l'adresse du serveur
-        struct sockaddr_in serverAddr;
-        memset(&serverAddr, 0, sizeof(serverAddr));
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        serverAddr.sin_port = htons(WEB_SOCKET_PORT + id);
-        
-        if (bind(webSocketServer, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            cerr << "Erreur lors du bind du socket web pour le processus " << id << endl;
-            close(webSocketServer);
-            return;
-        }
-        
-        if (listen(webSocketServer, 5) < 0) {
-            cerr << "Erreur lors de l'écoute du socket web pour le processus " << id << endl;
-            close(webSocketServer);
-            return;
-        }
-        
-        cout << "Interface web du processus " << id << " écoute sur le port " << (WEB_SOCKET_PORT + id) << endl;
-        
-        // Boucle d'acceptation des connexions
-        while (true) {
-            struct sockaddr_in clientAddr;
-            socklen_t clientAddrLen = sizeof(clientAddr);
-            
-            int clientSocket = accept(webSocketServer, (struct sockaddr*)&clientAddr, &clientAddrLen);
-            
-            if (clientSocket < 0) {
-                cerr << "Erreur lors de l'acceptation d'une connexion web pour le processus " << id << endl;
-                continue;
-            }
-            
-            webClients.push_back(clientSocket);
-            
-            // Envoi immédiat de l'état actuel
+
+    cout << "Processus " << id << " garde le jeton (aucun demandeur)" << endl;
+}
+
+// Serveur d'écoute des connexions entrantes
+void Process::runServer() {
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(BASE_PORT + id);
+
+    bind(serverSocket, (sockaddr*)&addr, sizeof(addr));
+    listen(serverSocket, NUM_PROCESS);
+
+    while (true) {
+        sockaddr_in cli{};
+        socklen_t len = sizeof(cli);
+        int cliSock = accept(serverSocket, (sockaddr*)&cli, &len);
+        if (cliSock < 0) continue;
+
+        char buf[16];
+        if (recv(cliSock, buf, sizeof(buf), 0) > 0) {
+            int peerId = atoi(buf);
             {
-                lock_guard<mutex> lock(uiStateMutex);
-                string jsonStr = uiState.dump();
-                send(clientSocket, jsonStr.c_str(), jsonStr.length(), 0);
+                lock_guard<mutex> lk(socketMutex);
+                clientSockets[peerId] = cliSock;
             }
-            
-            // Démarrage d'un thread pour gérer cette connexion
-            thread([this, clientSocket]() {
-                char buffer[1024];
-                while (true) {
-                    // Lecture des commandes depuis l'interface web
-                    int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-                    if (bytesRead <= 0) break;
-                    
-                    buffer[bytesRead] = '\0';
-                    string command(buffer);
-                    
-                    if (command == "fail") {
-                        fail();
-                    } else if (command == "recover") {
-                        recover();
-                    }
-                }
-                
-                // Suppression du client de la liste
-                auto it = find(webClients.begin(), webClients.end(), clientSocket);
-                if (it != webClients.end()) {
-                    webClients.erase(it);
-                }
-                
-                close(clientSocket);
-            }).detach();
+            thread(&Process::handleClientConnection, this, cliSock).detach();
         }
     }
-};
+}
+
+// Établissement des connexions avec les autres processus
+void Process::connectToOtherProcesses() {
+    cout << "Processus " << id << " : Tentative de connexion..." << endl;
+    for (int i=0; i<NUM_PROCESS; ++i) {
+        if (i==id) continue;
+        int sock = socket(AF_INET, SOCK_STREAM,0);
+        sockaddr_in a{AF_INET, htons(BASE_PORT+i), 0};
+        inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+        for(int attempt=0; attempt<5 && connect(sock,(sockaddr*)&a,sizeof(a))!=0; ++attempt)
+            this_thread::sleep_for(chrono::seconds(1));
+
+        string idStr = to_string(id);
+        send(sock, idStr.c_str(), idStr.size()+1, 0);
+        lock_guard<mutex> lk(socketMutex);
+        clientSockets[i]=sock;
+    }
+}
+
+// Gestion d'une connexion client
+void Process::handleClientConnection(int clientSocket) {
+    char buf[1024];
+    ssize_t n;
+    while ((n=recv(clientSocket, buf, sizeof(buf),0))>0) {
+        Message msg;
+        memcpy(&msg.type,   buf,               sizeof(msg.type));
+        memcpy(&msg.sender, buf+sizeof(msg.type), sizeof(int));
+        memcpy(&msg.clock,  buf+sizeof(msg.type)+sizeof(int), sizeof(int));
+        if (msg.type==TOKEN) {
+            msg.token.resize(NUM_PROCESS);
+            memcpy(msg.token.data(),
+                   buf+sizeof(msg.type)+2*sizeof(int),
+                   NUM_PROCESS*sizeof(int));
+        }
+        recevoirMessage(msg);
+    }
+}
+
+// Traitement d'un message reçu
+void Process::recevoirMessage(const Message& msg) {
+    int old = horlogelogique;
+    horlogelogique = max(horlogelogique.load(), msg.clock)+1;
+    cout << "Processus " << id << " : Msg de " << msg.sender
+         << (msg.type==REQUEST?" REQUEST":" TOKEN")
+         << " clk="<<msg.clock<<" (local "<<old<<"->"<<horlogelogique<<")\n";
+
+    if (msg.type==REQUEST) {
+        requetes[msg.sender]=max(requetes[msg.sender], msg.clock);
+        if (jetonpresent && !dedans && requetes[msg.sender]>jeton[msg.sender]) {
+            cout<<"Processus "<<id<<" : envoi jeton à "<<msg.sender<<endl;
+            jetonpresent=false;
+            Message m{TOKEN,id,horlogelogique,jeton};
+            envoiMessage(msg.sender,m);
+        }
+    } else {
+        jeton=msg.token;
+        jetonpresent=true;
+        cout<<"Processus "<<id<<" : Jeton reçu de "<<msg.sender<<endl;
+        tokenCV.notify_all();
+    }
+}
+
+// Envoi d'un message
+void Process::envoiMessage(int targetId, const Message& msg) {
+    lock_guard<mutex> lk(socketMutex);
+    auto it=clientSockets.find(targetId);
+    if (it==clientSockets.end()) return;
+    char buf[1024]; size_t off=0;
+    memcpy(buf+off,&msg.type,sizeof(msg.type)); off+=sizeof(msg.type);
+    memcpy(buf+off,&msg.sender,sizeof(int));     off+=sizeof(int);
+    memcpy(buf+off,&msg.clock,sizeof(int));      off+=sizeof(int);
+    if (msg.type==TOKEN) {
+        memcpy(buf+off,msg.token.data(),
+               msg.token.size()*sizeof(int));
+        off+=msg.token.size()*sizeof(int);
+    }
+    send(it->second,buf,off,0);
+}
+
+// Diffusion d'un message
+void Process::broadcastMessage(const Message& msg) {
+    vector<int> dests;
+    {
+      lock_guard<mutex> lk(socketMutex);
+      for(auto &p:clientSockets) dests.push_back(p.first);
+    }
+    for(int d:dests) envoiMessage(d,msg);
+}
+
+// màj de l'état du processus
+void Process::updateState(ProcessState newState) {
+    state=newState;
+    static const char* names[]={"IDLE","REQUESTING","IN_CS","FAILED"};
+    cout<<"Processus "<<id<<" : État changé à "<<names[newState]<<endl;
+}
+
+// Génération d'un temps aléatoire
+int Process::getRandomTime(int minSec, int maxSec) {
+    static mt19937 rng(random_device{}());
+    uniform_int_distribution<> dist(minSec,maxSec);
+    return dist(rng);
+}
