@@ -2,6 +2,8 @@
 #include <vector>
 
 using namespace std;
+//définir les types de messages (REQUEST, TOKEN, STATUS_UPDATE) et la structure Message
+
 
 enum MessageType {
  REQUEST, // demande de section critiques de tous les noeuds du systeme

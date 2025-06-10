@@ -2,6 +2,7 @@
 
 #include "Message.hpp"
 #include "Config.hpp"
+#include "WebSocketServer.hpp"
 #include <atomic>
 #include <thread>
 #include <condition_variable>
@@ -42,14 +43,17 @@ class Process {
   thread serverThread; // Thread d'écoute des connexions
   thread mainProcessThread;
 
+  // webSocket server reference
+  static WebSocketServer* ws_server;
 
+
+  //le coeur de l'algorithme
   void run(); // son programme principale ou il demande la ressource critique
   void demandeSC();
   void entrerSC();
   void quitterSC();
 
   //gestion des communications
-//  void runWebSocketServer();
   void runServer();                   // Serveur d'écoute des connexions
   void connectToOtherProcesses();     // Établit les connexions avec les autres processus
   void handleClientConnection(int clientSocket); // traite les messages d'un client (appelee par un thread separe pour gerer la comm avec un client specifique apres qu une connexion a ete etablie)
@@ -62,6 +66,10 @@ class Process {
   void updateState(ProcessState newState);
   int getRandomTime(int minMs, int maxMs);
 
+
+  // WebSocket notification methods
+  void notifyStateChange();
+
  public:
     Process(int id, bool initialToken = false);
     ~Process(); //automatically called when a Process object is destroyed
@@ -70,6 +78,14 @@ class Process {
     void stop();
     void fail();
     void recover();
+
+    // Static method to set WebSocket server
+    static void setWebSocketServer(WebSocketServer* server);
+    // Getters for frontend
+    ProcessState getState() const { return state.load(); }
+    int getId() const { return id; }
+    vector<int> getQueue() const { return requetes; }
+    bool hasToken() const { return jetonpresent.load(); }
 
 };
 
