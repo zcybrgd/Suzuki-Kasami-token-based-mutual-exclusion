@@ -78,12 +78,5 @@ Pendant cette période, il n'émet pas de requêtes et ne traite pas les message
 Après la période de panne, le processus revient à l'état IDLE
 
 
-## Tolérance aux pannes robuste : (on doit demander au professeur si c demande de faire ca)
-
-Implémenter un algorithme de détection de panne
-Ajouter un mécanisme de régénération du jeton en cas de perte
-
-
-
 
 
