@@ -42,12 +42,14 @@ class Process {
 
   thread serverThread; // Thread d'écoute des connexions
   thread mainProcessThread;
+  thread tokenCheckThread;
 
   // webSocket server reference
   static WebSocketServer* ws_server;
 
 
   //le coeur de l'algorithme
+void checkTokenLoss();
   void run(); // son programme principale ou il demande la ressource critique
   void demandeSC();
   void entrerSC();
@@ -58,6 +60,7 @@ class Process {
   void connectToOtherProcesses();     // Établit les connexions avec les autres processus
   void handleClientConnection(int clientSocket); // traite les messages d'un client (appelee par un thread separe pour gerer la comm avec un client specifique apres qu une connexion a ete etablie)
   void recevoirMessage(const Message& msg); // reception d un message recu
+
 
   // Envoi de messages
   void envoiMessage(int targetId, const Message& msg); // to all processes (apart ceux qui sont en panne)
@@ -87,5 +90,6 @@ class Process {
     vector<int> getQueue() const { return requetes; }
     bool hasToken() const { return jetonpresent.load(); }
 
+int getClock() const { return horlogelogique.load(); }
+    std::vector<int> getToken() const { return jeton; }
 };
-
