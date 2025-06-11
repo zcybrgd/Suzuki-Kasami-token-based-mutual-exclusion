@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <algorithm>
+#include "WebSocketServer.hpp"
 
 using namespace std;
 
@@ -36,19 +37,20 @@ void Process::setWebSocketServer(WebSocketServer* server) {
 
 //démarrage des threads du processus
 void Process::start() {
-    serverThread      = thread(&Process::runServer, this);
-    mainProcessThread = thread(&Process::run,       this);
+    serverThread = thread(&Process::runServer, this);
+    mainProcessThread = thread(&Process::run, this);
+    tokenCheckThread = thread(&Process::checkTokenLoss, this); // Nouveau thread
 }
 
 // Arrêt du processus et nettoyage
 void Process::stop() {
-    // signaler fin aux boucles
     enpanne = true;
     tokenCV.notify_all();
     shutdown(serverSocket, SHUT_RDWR);
 
-    if (serverThread.joinable())      serverThread.join();
+    if (serverThread.joinable()) serverThread.join();
     if (mainProcessThread.joinable()) mainProcessThread.join();
+    if (tokenCheckThread.joinable()) tokenCheckThread.join(); // Joindre le nouveau thread
 
     close(serverSocket);
     for (auto &p : clientSockets) close(p.second);
@@ -74,10 +76,13 @@ void Process::recover() {
     enpanne = false;
     updateState(IDLE);
     cout << "Processus " << id << " récupéré" << endl;
-    
-    // Reset request for this process
-    requetes[id] = 0;
-    tokenCV.notify_all();
+
+    // If we had a pending request, re-request SC
+    if (requetes[id] > 0) {
+        cout << "Processus " << id << " : Re-demande SC après récupération" << endl;
+        demandeSC();
+    }
+    notifyStateChange();
 }
 
 // Méthode principale du processus
@@ -102,7 +107,7 @@ void Process::run() {
         demandeSC();
         
         if (enpanne || !jetonpresent) continue;
-        
+
         // Enter CS
         entrerSC();
 
@@ -129,7 +134,7 @@ void Process::demandeSC() {
     if (enpanne) return;
 
     // Increment logical clock and set our request timestamp
-    horlogelogique++;
+    horlogelogique++; // Ensure clock advances
     requetes[id] = horlogelogique;
 
     updateState(REQUESTING);
@@ -152,61 +157,99 @@ void Process::demandeSC() {
 }
 
 // Entrée en section critique
-void Process::entrerSC() {
-    lock_guard<mutex> lock(tokenMutex);
-    if (!jetonpresent || enpanne) {
-        cout << "Processus " << id << " : Impossible d'entrer en SC (pas de jeton ou en panne)" << endl;
-        return;
-    }
-    
-    dedans = true;
-    updateState(IN_CS);
-    cout << "Processus " << id << " entre en SC" << endl;
-}
 
-// Sortie de section critique
 void Process::quitterSC() {
     lock_guard<mutex> lock(tokenMutex);
     
     if (!dedans) return;
     
     dedans = false;
-    jeton[id] = horlogelogique; // Update token with current timestamp
+    jeton[id] = horlogelogique; // Update token with current logical clock
     requetes[id] = 0; // Clear our own request
 
     updateState(IDLE);
     cout << "Processus " << id << " sort de SC" << endl;
 
-    // Find the next process that should get the token
-    // Priority: oldest request timestamp that is newer than token timestamp
+    // Debug: Print the requetes and jeton arrays
+    cout << "Processus " << id << " : requetes = [";
+    for (int j = 0; j < NUM_PROCESS; ++j) {
+        cout << requetes[j] << (j < NUM_PROCESS - 1 ? ", " : "");
+    }
+    cout << "]" << endl;
+    cout << "Processus " << id << " : jeton = [";
+    for (int j = 0; j < NUM_PROCESS; ++j) {
+        cout << jeton[j] << (j < NUM_PROCESS - 1 ? ", " : "");
+    }
+    cout << "]" << endl;
+
+    // Find the next process with a pending request
     int nextProcess = -1;
-    int oldestRequestTime = INT_MAX;
-    
-    for (int j = 0; j < NUM_PROCESS; j++) {
-        if (j != id && !enpanne && requetes[j] > jeton[j] && requetes[j] > 0) {
-            if (requetes[j] < oldestRequestTime) {
-                nextProcess = j;
-                oldestRequestTime = requetes[j];
-            }
+    for (int j = 0; j < NUM_PROCESS; ++j) {
+        if (j != id && requetes[j] > jeton[j] && requetes[j] > 0) {
+            nextProcess = j;
+            break; // Take the first process with a pending request
         }
     }
 
     if (nextProcess != -1) {
-        cout << "Processus " << id << " envoie le jeton au processus " << nextProcess 
-             << " (requête timestamp: " << requetes[nextProcess] << ")" << endl;
+        cout << "Processus " << id << " envoie le jeton à P" << nextProcess 
+             << " (req=" << requetes[nextProcess] << ", token=" << jeton[nextProcess] << ")" << endl;
         jetonpresent = false;
         Message m{TOKEN, id, horlogelogique, jeton};
         envoiMessage(nextProcess, m);
     } else {
-        cout << "Processus " << id << " garde le jeton (aucun demandeur valide)" << endl;
+        cout << "Processus " << id << " garde le jeton (aucune requête prioritaire)" << endl;
+    }
+}
+
+void Process::entrerSC() {
+    unique_lock<mutex> lock(tokenMutex);
+    tokenCV.wait(lock, [&]{
+        return jetonpresent.load() && !enpanne.load();
+    });
+
+    // Recheck requests in a loop to handle incoming messages
+    while (true) {
+        int nextProcess = -1;
+        for (int j = 0; j < NUM_PROCESS; ++j) {
+            if (j != id && requetes[j] > jeton[j] && requetes[j] > 0) {
+                if (requetes[id] == 0 || requetes[j] < requetes[id] || (requetes[j] == requetes[id] && j < id)) {
+                    nextProcess = j;
+                    break;
+                }
+            }
+        }
+
+        if (nextProcess != -1) {
+            cout << "Processus " << id << " détecte une requête prioritaire de P" << nextProcess << endl;
+            jetonpresent = false;
+            Message m{TOKEN, id, horlogelogique, jeton};
+            envoiMessage(nextProcess, m);
+            tokenCV.wait(lock, [&]{ return jetonpresent.load() && !enpanne.load(); });
+        } else {
+            dedans = true;
+            updateState(IN_CS);
+            cout << "Processus " << id << " entre en SC" << endl;
+            break;
+        }
     }
 }
 
 // Serveur d'écoute des connexions entrantes
 void Process::runServer() {
     serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        cout << "Processus " << id << " : Échec création socket serveur (errno=" << errno << ")" << endl;
+        return;
+    }
+    cout << "Processus " << id << " : Socket serveur créé (fd=" << serverSocket << ")" << endl;
+
     int opt = 1;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        cout << "Processus " << id << " : Échec setsockopt (errno=" << errno << ")" << endl;
+        close(serverSocket);
+        return;
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -214,39 +257,48 @@ void Process::runServer() {
     addr.sin_port = htons(BASE_PORT + id);
 
     if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind failed");
+        cout << "Processus " << id << " : Échec bind sur port " << (BASE_PORT + id) << " (errno=" << errno << ")" << endl;
+        close(serverSocket);
         return;
     }
+    cout << "Processus " << id << " : Bind réussi sur port " << (BASE_PORT + id) << endl;
     
     if (listen(serverSocket, NUM_PROCESS) < 0) {
-        perror("listen failed");
+        cout << "Processus " << id << " : Échec listen (errno=" << errno << ")" << endl;
+        close(serverSocket);
         return;
     }
-
     cout << "Processus " << id << " : Serveur démarré sur port " << (BASE_PORT + id) << endl;
 
     while (!enpanne) {
         sockaddr_in cli{};
         socklen_t len = sizeof(cli);
+        cout << "Processus " << id << " : Attente connexion sur socket " << serverSocket << endl;
         int cliSock = accept(serverSocket, (sockaddr*)&cli, &len);
         if (cliSock < 0) {
-            if (!enpanne) perror("accept failed");
+            if (!enpanne) cout << "Processus " << id << " : Échec accept (errno=" << errno << ")" << endl;
             continue;
         }
+        cout << "Processus " << id << " : Connexion acceptée, socket client=" << cliSock << endl;
 
         char buf[16];
-        if (recv(cliSock, buf, sizeof(buf), 0) > 0) {
+        ssize_t n = recv(cliSock, buf, sizeof(buf), 0);
+        if (n > 0) {
+            buf[n] = '\0'; // Null-terminate
             int peerId = atoi(buf);
-            cout << "Processus " << id << " : Connexion acceptée de processus " << peerId << endl;
+            cout << "Processus " << id << " : Connexion acceptée de processus " << peerId << " sur socket " << cliSock << endl;
             {
                 lock_guard<mutex> lk(socketMutex);
                 clientSockets[peerId] = cliSock;
             }
             thread(&Process::handleClientConnection, this, cliSock).detach();
+        } else {
+            cout << "Processus " << id << " : Échec réception ID client (n=" << n << ", errno=" << errno << ")" << endl;
+            close(cliSock);
         }
     }
+    close(serverSocket);
 }
-
 // Établissement des connexions avec les autres processus
 void Process::connectToOtherProcesses() {
     cout << "Processus " << id << " : Tentative de connexion aux autres processus..." << endl;
@@ -286,105 +338,162 @@ void Process::connectToOtherProcesses() {
 void Process::handleClientConnection(int clientSocket) {
     char buf[1024];
     ssize_t n;
+    cout << "Processus " << id << " : Début gestion connexion sur socket " << clientSocket << endl;
     while ((n = recv(clientSocket, buf, sizeof(buf), 0)) > 0) {
-        Message msg;
-        memcpy(&msg.type,   buf, sizeof(msg.type));
-        memcpy(&msg.sender, buf + sizeof(msg.type), sizeof(int));
-        memcpy(&msg.clock,  buf + sizeof(msg.type) + sizeof(int), sizeof(int));
-        
-        if (msg.type == TOKEN) {
-            msg.token.resize(NUM_PROCESS);
-            memcpy(msg.token.data(),
-                   buf + sizeof(msg.type) + 2 * sizeof(int),
-                   NUM_PROCESS * sizeof(int));
+        if (enpanne) {
+            cout << "Processus " << id << " : Ignorer message, processus en panne" << endl;
+            break;
         }
-        
+        cout << "Processus " << id << " : Reçu " << n << " octets sur socket " << clientSocket << endl;
+        cout << "Processus " << id << " : Données brutes=[";
+        for (ssize_t i = 0; i < n; ++i) cout << hex << (int)(unsigned char)buf[i] << " ";
+        cout << dec << "]" << endl;
+
+        if (n < static_cast<ssize_t>(sizeof(MessageType) + 2 * sizeof(int))) {
+            cout << "Processus " << id << " : Message incomplet (taille=" << n << ")" << endl;
+            continue;
+        }
+
+        Message msg;
+        memcpy(&msg.type, buf, sizeof(msg.type));
+        memcpy(&msg.sender, buf + sizeof(msg.type), sizeof(int));
+        memcpy(&msg.clock, buf + sizeof(msg.type) + sizeof(int), sizeof(int));
+
+        cout << "Processus " << id << " : Message décodé: type=" << (msg.type == REQUEST ? "REQUEST" : "TOKEN")
+             << ", sender=" << msg.sender << ", clock=" << msg.clock << endl;
+
+        if (msg.type == TOKEN) {
+            if (n < static_cast<ssize_t>(sizeof(MessageType) + 2 * sizeof(int) + NUM_PROCESS * sizeof(int))) {
+                cout << "Processus " << id << " : Message TOKEN incomplet (taille=" << n << ")" << endl;
+                continue;
+            }
+            msg.token.resize(NUM_PROCESS);
+            memcpy(msg.token.data(), buf + sizeof(msg.type) + 2 * sizeof(int), NUM_PROCESS * sizeof(int));
+            cout << "Processus " << id << " : Jeton décodé, contenu=[";
+            for (int v : msg.token) cout << v << ",";
+            cout << "]" << endl;
+        }
+
         recevoirMessage(msg);
     }
-    
-    if (n <= 0) {
-        close(clientSocket);
+
+    if (n < 0) {
+        cout << "Processus " << id << " : Erreur réception sur socket " << clientSocket
+             << " (errno=" << errno << ")" << endl;
+    } else {
+        cout << "Processus " << id << " : Connexion fermée avec socket " << clientSocket
+             << " (recv=" << n << ")" << endl;
     }
+    close(clientSocket);
 }
 
 // Traitement d'un message reçu
 void Process::recevoirMessage(const Message& msg) {
     lock_guard<mutex> lock(tokenMutex);
-    
+
     if (enpanne) {
         cout << "Processus " << id << " : Message ignoré (processus en panne)" << endl;
         return;
     }
-    
-    int oldClock = horlogelogique;
-    horlogelogique = max(horlogelogique.load(), msg.clock) + 1;
-    
-    cout << "Processus " << id << " : Reçu " 
-         << (msg.type == REQUEST ? "REQUEST" : "TOKEN") 
-         << " de P" << msg.sender 
-         << " (clk:" << msg.clock << ", local:" << oldClock << "->" << horlogelogique << ")" << endl;
+
+    int oldClock = horlogelogique.load(); // Use .load() to get current value
+    horlogelogique = std::max(horlogelogique.load(), msg.clock) + 1; // Fix: Use .load()
+
+    cout << "Processus " << id << " : Reçu "
+         << (msg.type == REQUEST ? "REQUEST" : "TOKEN")
+         << " de P" << msg.sender
+         << " (clk:" << msg.clock << ", local:" << oldClock << "->" << horlogelogique.load() << ")" << endl;
 
     if (msg.type == REQUEST) {
-        // Update the request queue with sender's request
         requetes[msg.sender] = msg.clock;
-        cout << "Processus " << id << " : Requête de P" << msg.sender 
+        cout << "Processus " << id << " : Requête de P" << msg.sender
              << " enregistrée avec timestamp " << msg.clock << endl;
-        
-        // If we have the token, not in CS, and this request has priority
-        if (jetonpresent && !dedans) {
-            // Check if this request should be satisfied immediately
-            if (requetes[msg.sender] > jeton[msg.sender]) {
-                cout << "Processus " << id << " : Envoi immédiat du jeton à P" << msg.sender << endl;
+
+        if (jetonpresent && !dedans && state == REQUESTING) {
+            int nextProcess = -1;
+            for (int j = 0; j < NUM_PROCESS; ++j) {
+                if (j != id && requetes[j] > jeton[j] && requetes[j] > 0) {
+                    if (nextProcess == -1 ||
+                        requetes[j] < requetes[nextProcess] ||
+                        (requetes[j] == requetes[nextProcess] && j < nextProcess)) {
+                        nextProcess = j;
+                    }
+                }
+            }
+            if (nextProcess != -1 && (requetes[id] == 0 || requetes[nextProcess] < requetes[id] ||
+                                     (requetes[nextProcess] == requetes[id] && nextProcess < id))) {
+                cout << "Processus " << id << " : Envoi du jeton à P" << nextProcess << endl;
                 jetonpresent = false;
-                Message tokenMsg{TOKEN, id, horlogelogique, jeton};
-                envoiMessage(msg.sender, tokenMsg);
+                Message tokenMsg{TOKEN, id, horlogelogique.load(), jeton}; // Use .load() for consistency
+                envoiMessage(nextProcess, tokenMsg);
             }
         }
     } else if (msg.type == TOKEN) {
-        // Receive the token
         jeton = msg.token;
         jetonpresent = true;
+        jeton[id] = horlogelogique.load(); // Use .load() for consistency
         cout << "Processus " << id << " : Jeton reçu de P" << msg.sender << endl;
-        
-        // Notify waiting thread
-        tokenCV.notify_all();
+
+        // If we were requesting, try to enter CS
+        if (state == REQUESTING && !dedans) {
+            cout << "Processus " << id << " : Tentative d'entrée en SC après réception jeton" << endl;
+            tokenCV.notify_all();
+        }
     }
-    
-    // Notify WebSocket clients of state change
+
     notifyStateChange();
 }
-
+ 
+  
 // Envoi d'un message
 void Process::envoiMessage(int targetId, const Message& msg) {
     lock_guard<mutex> lk(socketMutex);
+    if (enpanne) return;
+
     auto it = clientSockets.find(targetId);
-    if (it == clientSockets.end()) {
-        cout << "Processus " << id << " : Pas de connexion vers P" << targetId << endl;
-        return;
+    if (it == clientSockets.end() || it->second <= 0) {
+        cout << "Processus " << id << " : Connexion vers P" << targetId << " invalide, tentative de reconnexion" << endl;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(BASE_PORT + targetId);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
+            string idStr = to_string(id);
+            send(sock, idStr.c_str(), idStr.size() + 1, 0);
+            clientSockets[targetId] = sock;
+            it = clientSockets.find(targetId);
+        } else {
+            cout << "Processus " << id << " : Échec de reconnexion à P" << targetId << endl;
+            close(sock);
+            return;
+        }
     }
-    
+
     char buf[1024];
     size_t offset = 0;
-    
     memcpy(buf + offset, &msg.type, sizeof(msg.type));
     offset += sizeof(msg.type);
-    
     memcpy(buf + offset, &msg.sender, sizeof(int));
     offset += sizeof(int);
-    
     memcpy(buf + offset, &msg.clock, sizeof(int));
     offset += sizeof(int);
-    
     if (msg.type == TOKEN) {
         memcpy(buf + offset, msg.token.data(), msg.token.size() * sizeof(int));
         offset += msg.token.size() * sizeof(int);
     }
-    
-    if (send(it->second, buf, offset, 0) < 0) {
-        cout << "Processus " << id << " : Erreur envoi vers P" << targetId << endl;
+
+    ssize_t sent = send(it->second, buf, offset, 0);
+    if (sent < 0 || static_cast<size_t>(sent) != offset) {
+        cout << "Processus " << id << " : Erreur envoi " << (msg.type == REQUEST ? "REQUEST" : "TOKEN")
+             << " vers P" << targetId << " (envoyé " << sent << "/" << offset << " octets)" << endl;
+        close(it->second);
+        clientSockets.erase(targetId);
+    } else {
+        cout << "Processus " << id << " : Message " << (msg.type == REQUEST ? "REQUEST" : "TOKEN")
+             << " envoyé à P" << targetId << " (" << offset << " octets)" << endl;
     }
 }
-
 // Diffusion d'un message
 void Process::broadcastMessage(const Message& msg) {
     vector<int> targets;
@@ -418,7 +527,7 @@ void Process::updateState(ProcessState newState) {
 void Process::notifyStateChange() {
     if (ws_server) {
         string state_str;
-        switch(state.load()) {
+        switch (state) { // Removed .load()
             case IDLE: state_str = "IDLE"; break;
             case REQUESTING: state_str = "REQUESTING"; break;
             case IN_CS: state_str = "IN_CS"; break;
@@ -433,4 +542,50 @@ int Process::getRandomTime(int minSec, int maxSec) {
     static mt19937 rng(random_device{}());
     uniform_int_distribution<> dist(minSec, maxSec);
     return dist(rng);
+}
+
+void Process::checkTokenLoss() {
+    while (!enpanne) {
+        this_thread::sleep_for(chrono::seconds(5)); // Reduced to 5s for faster recovery
+        if (id == 0 && !jetonpresent && state == REQUESTING) {
+            lock_guard<mutex> lock(tokenMutex);
+            bool otherRequesting = false;
+            for (int j = 0; j < NUM_PROCESS; ++j) {
+                if (j != id && requetes[j] > 0) {
+                    otherRequesting = true;
+                    break;
+                }
+            }
+            if (!otherRequesting) {
+                cout << "Processus " << id << " : Régénération du jeton (aucune requête)" << endl;
+                jetonpresent = true;
+                jeton = vector<int>(NUM_PROCESS, 0);
+                requetes = vector<int>(NUM_PROCESS, 0);
+                tokenCV.notify_all();
+            } else {
+                // Check if token is stuck with a failed process
+                bool tokenLost = true;
+                for (int j = 0; j < NUM_PROCESS; ++j) {
+                    if (j != id && clientSockets.find(j) != clientSockets.end()) {
+                        // Assume a simple ping to check if process is alive
+                        // In practice, use a heartbeat mechanism
+                        char ping = 'P';
+                        if (send(clientSockets[j], &ping, 1, 0) > 0) {
+                            tokenLost = false;
+                            break;
+                        }
+                    }
+                }
+                if (tokenLost) {
+                    cout << "Processus " << id << " : Régénération du jeton (jeton perdu)" << endl;
+                    jetonpresent = true;
+                    jeton = vector<int>(NUM_PROCESS, 0);
+                    requetes = vector<int>(NUM_PROCESS, 0);
+                    tokenCV.notify_all();
+                } else {
+                    cout << "Processus " << id << " : Régénération différée, autres requêtes en cours" << endl;
+                }
+            }
+        }
+    }
 }
