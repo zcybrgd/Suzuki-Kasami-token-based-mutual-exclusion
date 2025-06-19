@@ -27,7 +27,7 @@ void Process::handle_message(int client_socket) {
             break;
             
         case REPLY:
-            // Shouldn't happen in Suzuki-Kasami, just acknowledge
+            // Shouldn't happen in Suzuki-Kasami but just in case the prof demanded RA81 instead of RA83, just acknowledge
             break;
             
         case TOKEN:
@@ -48,7 +48,7 @@ void Process::send_token(int receiver) {
     
     std::cout << "Process " << id << " sending token to " << receiver << std::endl;
     
-    // Update token's RN array before sending
+    //update token's RN array before sending
     RN = LN;
     
     write(client_sockets[receiver], &token_msg, sizeof(token_msg));
@@ -75,15 +75,15 @@ void Process::server_loop() {
 }
 
 void Process::setup_server() {
+    //this creates a tcp socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
-    
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(BASE_PORT + id);
-    
+    server_addr.sin_port = htons(BASE_PORT + id); // the port number of the socket it should be unique
+    //and here we bind the socket to its port number
     if (bind(server_fd, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
         exit(EXIT_FAILURE);
@@ -93,13 +93,14 @@ void Process::setup_server() {
         perror("listen");
         exit(EXIT_FAILURE);
     }
-    
+    //here we make the socket ready to accept connections by executing the function server_loop (socket is ready to work)
     server_thread = std::thread(&Process::server_loop, this);
 }
 
 void Process::setup_clients() {
+    //each process connect to the other 9 available
     client_sockets.resize(NUM_PROCESSES, -1);
-    
+    //the loop of connecting to the nine other servers sockets
     for (int i = 0; i < NUM_PROCESSES; i++) {
         if (i == id) continue;
         
@@ -118,19 +119,19 @@ void Process::setup_clients() {
             continue;
         }
         
-        // Retry connection until successful
+        //Retry connection until successful on sait jamais we have deadlocks somewher
         while (connect(sock, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
             std::cout << "Process " << id << " failed to connect to " << i << ", retrying..." << std::endl;
             sleep(1);
         }
-        
+        //this quite literally lead us to full mesh connectivity like mentioned f le cours
         client_sockets[i] = sock;
     }
 }
 
 Process::Process(int pid) : id(pid), sequence_number(0), has_token(false), requesting(false), 
                   LN(NUM_PROCESSES, 0), RN(NUM_PROCESSES, 0) {
-    if (id == 0) has_token = true; // Initialize token at process 0
+    if (id == 0) has_token = true; //initialize token at first process
     
     setup_server();
     setup_clients();
@@ -151,7 +152,7 @@ void Process::request_critical_section() {
     
     std::cout << "Process " << id << " requesting CS with SN: " << sequence_number << std::endl;
     
-    // Broadcast request to all other processes
+    //Broadcast request to all other processes
     Message msg;
     msg.type = REQUEST;
     msg.sender_id = id;
@@ -163,7 +164,7 @@ void Process::request_critical_section() {
         }
     }
     
-    // Wait for token
+    //Wait for token
     cv.wait(lock, [this]() { return has_token; });
 }
 
@@ -172,7 +173,7 @@ void Process::release_critical_section() {
     RN[id] = LN[id];
     requesting = false;
     
-    // Check if there are pending requests
+    //check if there are pending requests to send to the first one that we meet asking for token
     for (int i = 0; i < NUM_PROCESSES; i++) {
         if (RN[i] == LN[i] - 1 && i != id) {
             send_token(i);
@@ -185,7 +186,7 @@ void Process::release_critical_section() {
 
 void Process::critical_section() {
     std::cout << "Process " << id << " entering critical section" << std::endl;
-    // Simulate work in critical section
+    // Simulate work in critical section (like in TP enonce)
     sleep(1 + rand() % 3);
     std::cout << "Process " << id << " exiting critical section" << std::endl;
 }
