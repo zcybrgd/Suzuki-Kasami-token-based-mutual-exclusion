@@ -4,9 +4,7 @@
 WebSocketServer::WebSocketServer() : running(false) {
     ws_server.set_access_channels(websocketpp::log::alevel::all);
     ws_server.clear_access_channels(websocketpp::log::alevel::frame_payload);
-    // Initialize ASIO
     ws_server.init_asio();
-    // Set handlers
     ws_server.set_open_handler([this](websocketpp::connection_hdl hdl) {
         this->on_open(hdl);
     });
@@ -16,7 +14,6 @@ WebSocketServer::WebSocketServer() : running(false) {
     ws_server.set_message_handler([this](websocketpp::connection_hdl hdl, message_ptr msg) {
         this->on_message(hdl, msg);
     });
-    // Set reuse address
     ws_server.set_reuse_addr(true);
 }
 
@@ -43,10 +40,10 @@ void WebSocketServer::stop() {
 
 void WebSocketServer::run_server() {
     try {
-        // Listen on port
+        //Listen on port
         ws_server.listen(WEBSOCKET_PORT);
         ws_server.start_accept();
-        // Start the server
+        // start the server
         ws_server.run();
     } catch (websocketpp::exception const & e) {
         std::cout << "WebSocket server error: " << e.what() << std::endl;
