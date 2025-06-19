@@ -1,6 +1,17 @@
 # Ricart-Agrawala-with-token-based-mutual-exclusion
-simulating Ricart &amp; Agrawala 1983 with token-based mutual exclusion, peer-to-peer sockets, multithreading, and GUI to visualize process communication and token handover 
+La classe C2 regroupe les algorithmes d’exclusion mutuelle basés sur la circulation d’un jeton (ou privilège) entre les processus d’un système réparti. Ces algorithmes évitent l’accès concurrent à une section critique (SC) en s’assurant qu’un seul processus possède le jeton à la fois.
 
+## Hypothèses du modèle
+
+- Le réseau est complètement maillé
+
+- Les messages peuvent être transmis sans erreur, mais :
+
+        Les délais sont variables.
+
+        Les messages peuvent arriver dans le désordre (déséquencement possible).
+
+Cela impose de gérer correctement l’ordre logique des événements (via des horloges logiques de Lamport).
 
 ## Compilation
 

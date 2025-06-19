@@ -5,6 +5,12 @@ const int BASE_PORT=8000; // the starrting tcp port for listening between nodes 
 const int WEBSOCKET_PORT=9000; // for the websocket ui dashboard
 
 
+inline int getProcessPort(int id){
+
+  return BASE_PORT + id;
+}
+
+
 /*
 
 to avoid hardcoding values throughout the codebase.

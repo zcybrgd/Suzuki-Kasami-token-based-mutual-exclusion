@@ -3,89 +3,83 @@
 #include "Message.hpp"
 #include "Config.hpp"
 #include "WebSocketServer.hpp"
+#include "Token.hpp"
+
 #include <atomic>
 #include <thread>
 #include <condition_variable>
 #include <mutex>
 #include <map>
+#include <vector>
+
 using namespace std;
 
 enum ProcessState {
-
- IDLE, // repos
-
-REQUESTING, IN_CS, FAILED // en panne
-
-};
-
-
+    IDLE, //repos
+    REQUESTING, IN_CS, FAILED};
 
 class Process {
+private:
+    int id;
+    atomic<int> horlogeLogique; // horloge logique de lamport du processus a cet instant
+    atomic<bool> jetonPresent; // détention du jeton ou pas
+    atomic<ProcessState> state;  //État du processus
+    atomic<bool> dansSC; //nous sommes inside la section critique?
+    atomic<bool> enPanne; //cas de panne simulée
 
- private:
-  int id;
-  atomic<int> horlogelogique; // horloge logique locale de lamport
-  atomic<bool> jetonpresent;              // possession du jeton
-  atomic<ProcessState> state;         // État du processus
-  vector<int> jeton;                  // Tableau du jeton
-  vector<int> requetes;               // Tableau des requêtes
-  atomic<bool> dedans;                  // Dans la section critique
-  atomic<bool> enpanne; // has failed ou pas
+    vector<int> requetes;// requetes[i] = dernière horloge reçue de Pi
+    Token* jeton;  // Jeton (tableau LN[i]), présent uniquement si jetonPresent == true
 
-  mutex tokenMutex;
-  condition_variable tokenCV;
+    mutex tokenMutex;
+    condition_variable tokenCV;
 
-  // Socket serveur et sockets clients
-  int serverSocket;
-  mutex socketMutex;
-  map<int, int> clientSockets; // Map de (id -> socket)
+    //pour la communication socket
+    int serverSocket; //chaque process est un serveur qui ecoute sur un port unique BASE_PORT+id
+    map<int, int> clientSockets; //chaque process est un client tcp qui se connecte au 9 autres
+    mutex socketMutex;
 
-  thread serverThread; // Thread d'écoute des connexions
-  thread mainProcessThread;
+    thread serverThread;
+    thread mainThread;
 
-  // webSocket server reference
-  static WebSocketServer* ws_server;
+    // websocket dashboard
+    static WebSocketServer* ws_server;
 
+    //fonctionnement interne
+    void run(); // boucle principale qui contient la logique du programme ran by the process et attend de 1 a 5 sec avant de demander une sc
+    void demanderSC();//envoie REQ aux autres
+    void entrerSC(); //attente jeton puis SC
+    void quitterSC();//màj jeton et cherche à qui le transmettre
 
-  //le coeur de l'algorithme
-  void run(); // son programme principale ou il demande la ressource critique
-  void demandeSC();
-  void entrerSC();
-  void quitterSC();
+    // communication peer-to-peer
+    void runServer(); // TCP Server
+    void connectToPeers();// TCP Clients
+    void handleClient(int clientSocket);
+    void recevoirMessage(const Message& msg);// traitement REQ ou l'acquistion d'unTOKEN
 
-  //gestion des communications
-  void runServer();                   // Serveur d'écoute des connexions
-  void connectToOtherProcesses();     // Établit les connexions avec les autres processus
-  void handleClientConnection(int clientSocket); // traite les messages d'un client (appelee par un thread separe pour gerer la comm avec un client specifique apres qu une connexion a ete etablie)
-  void recevoirMessage(const Message& msg); // reception d un message recu
+    void envoyerMessage(int targetId, const Message& msg);//pour envoyer le jeton au client cible
+    void broadcastMessage(const Message& msg);//pour diffuser une requete SC
 
-  // Envoi de messages
-  void envoiMessage(int targetId, const Message& msg); // to all processes (apart ceux qui sont en panne)
-  void broadcastMessage(const Message& msg);
+    // === WEBSOCKET ET UTILITAIRES ===
+    void updateState(ProcessState newState);
+    void notifyStateChange();
+    int getRandomDelay(int minMs, int maxMs);
 
-  void updateState(ProcessState newState);
-  int getRandomTime(int minMs, int maxMs);
-
-
-  // WebSocket notification methods
-  void notifyStateChange();
-
- public:
+public:
     Process(int id, bool initialToken = false);
-    ~Process(); //automatically called when a Process object is destroyed
+    ~Process();
 
-    void start();
-    void stop();
-    void fail();
-    void recover();
+    void start();      //lance le serveur et la logique de demande SC
+    void stop();       //arrête tous les threads
 
-    // Static method to set WebSocket server
+    void fail();       //simule un crash
+    void recover();    //reprise après crash
+
     static void setWebSocketServer(WebSocketServer* server);
-    // Getters for frontend
+
+    // Accès pour le frontend
     ProcessState getState() const { return state.load(); }
     int getId() const { return id; }
     vector<int> getQueue() const { return requetes; }
-    bool hasToken() const { return jetonpresent.load(); }
-
+    bool hasToken() const { return jetonPresent.load(); }
+    bool isFailed() const { return enPanne.load(); }
 };
-
