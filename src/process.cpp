@@ -1,3 +1,14 @@
+//each Process acts as a node in a simulated distributed system able to send and eceive messages, request the critical section (CS), and pass the token
+//what do i need to take in consideration while coding (from l enonce tae TP):
+/*
+in Suzuki-Kasami: Only one token exists. The process with the token can enter the CS. Other processes request it by broadcasting their sequence number.
+
+TCP Sockets are solely used for IPC
+
+Each server accepts connections in a loop and handles them using detached threads
+ */
+
+
 #include "Process.hpp"
 #include "Config.hpp"
 void Process::handle_message(int client_socket) {
