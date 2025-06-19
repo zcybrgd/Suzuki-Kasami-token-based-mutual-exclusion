@@ -1,231 +1,180 @@
 #include "Process.hpp"
-#include <iostream>
-#include <sstream>
-#include <chrono>
-#include <thread>
-#include <nlohmann/json.hpp>
-#include <cstring>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include "Config.hpp"
+void Process::handle_message(int client_socket) {
+    Message msg;
+    read(client_socket, &msg, sizeof(msg));
+    
+    std::unique_lock<std::mutex> lock(mtx);
+    
+    switch(msg.type) {
+        case REQUEST:
+            LN[msg.sender_id] = std::max(LN[msg.sender_id], msg.sequence_number);
+            if (has_token && !requesting && 
+                RN[msg.sender_id] == LN[msg.sender_id] - 1) {
+                send_token(msg.sender_id);
+            }
+            break;
+            
+        case REPLY:
+            // Shouldn't happen in Suzuki-Kasami, just acknowledge
+            break;
+            
+        case TOKEN:
+            has_token = true;
+            requesting = false;
+            std::cout << "Process " << id << " received token" << std::endl;
+            cv.notify_all();
+            break;
+    }
+}
 
-using namespace std;
-using json = nlohmann::json;
+void Process::send_token(int receiver) {
+    has_token = false;
+    Message token_msg;
+    token_msg.type = TOKEN;
+    token_msg.sender_id = id;
+    token_msg.sequence_number = 0;
+    
+    std::cout << "Process " << id << " sending token to " << receiver << std::endl;
+    
+    // Update token's RN array before sending
+    RN = LN;
+    
+    write(client_sockets[receiver], &token_msg, sizeof(token_msg));
+}
 
-WebSocketServer* Process::ws_server = nullptr;
+void Process::server_loop() {
+    while (true) {
+        int new_socket;
+        sockaddr_in address;
+        int addrlen = sizeof(address);
+        
+        if ((new_socket = accept(server_fd, (sockaddr*)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("accept");
+            continue;
+        }
+        
+        std::thread([this, new_socket]() {
+            while (true) {
+                handle_message(new_socket);
+            }
+            close(new_socket);
+        }).detach();
+    }
+}
 
-Process::Process(int id, bool initialToken)
-    : id(id), horlogeLogique(0), jetonPresent(initialToken),
-      state(IDLE), dansSC(false), enPanne(false) {
-    requetes.resize(NUM_PROCESS, 0);
-    jeton = initialToken ? new Token(NUM_PROCESS) : nullptr;
+void Process::setup_server() {
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+    
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(BASE_PORT + id);
+    
+    if (bind(server_fd, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+    
+    server_thread = std::thread(&Process::server_loop, this);
+}
+
+void Process::setup_clients() {
+    client_sockets.resize(NUM_PROCESSES, -1);
+    
+    for (int i = 0; i < NUM_PROCESSES; i++) {
+        if (i == id) continue;
+        
+        int sock = 0;
+        if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            perror("socket creation failed");
+            continue;
+        }
+        
+        sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(BASE_PORT + i);
+        
+        if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+            perror("invalid address");
+            continue;
+        }
+        
+        // Retry connection until successful
+        while (connect(sock, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+            std::cout << "Process " << id << " failed to connect to " << i << ", retrying..." << std::endl;
+            sleep(1);
+        }
+        
+        client_sockets[i] = sock;
+    }
+}
+
+Process::Process(int pid) : id(pid), sequence_number(0), has_token(false), requesting(false), 
+                  LN(NUM_PROCESSES, 0), RN(NUM_PROCESSES, 0) {
+    if (id == 0) has_token = true; // Initialize token at process 0
+    
+    setup_server();
+    setup_clients();
 }
 
 Process::~Process() {
-    stop();
-    if (jeton) delete jeton;
-}
-
-void Process::start() {
-    connectToPeers();
-    serverThread = thread(&Process::runServer, this);
-    mainThread = thread(&Process::run, this);
-}
-
-void Process::stop() {
-    enPanne = true;
-    if (serverThread.joinable()) serverThread.join();
-    if (mainThread.joinable()) mainThread.join();
-    close(serverSocket);
-    for (auto& [_, sock] : clientSockets) close(sock);
-}
-
-void Process::fail() {
-    enPanne = true;
-    updateState(FAILED);
-}
-
-void Process::recover() {
-    enPanne = false;
-    updateState(IDLE);
-}
-
-void Process::run() {
-    while (true) {
-        if (enPanne) {
-            this_thread::sleep_for(chrono::seconds(1));
-            continue;
-        }
-
-        this_thread::sleep_for(chrono::milliseconds(getRandomDelay(1000, 5000)));
-        demanderSC();
-        entrerSC();
-        quitterSC();
+    for (int sock : client_sockets) {
+        if (sock != -1) close(sock);
     }
+    close(server_fd);
 }
 
-void Process::demanderSC() {
-    horlogeLogique++;
-    requetes[id] = horlogeLogique;
-    updateState(REQUESTING);
-
-    Message req{REQUEST, id, horlogeLogique, {}};
-    broadcastMessage(req);
-}
-
-void Process::entrerSC() {
-    unique_lock<mutex> lock(tokenMutex);
-    tokenCV.wait(lock, [&]() { return jetonPresent.load(); });
-    updateState(IN_CS);
-    dansSC = true;
-    this_thread::sleep_for(chrono::milliseconds(getRandomDelay(1000, 2000)));
-}
-
-void Process::quitterSC() {
-    dansSC = false;
-    horlogeLogique++;
-    jeton->lastRequestClock[id] = horlogeLogique;
-
-    for (int j = (id + 1) % NUM_PROCESS; j != id; j = (j + 1) % NUM_PROCESS) {
-        if (requetes[j] > jeton->lastRequestClock[j]) {
-            Message tokenMsg{TOKEN, id, horlogeLogique, jeton->lastRequestClock};
-            envoyerMessage(j, tokenMsg);
-            jetonPresent = false;
-            updateState(IDLE);
-            return;
+void Process::request_critical_section() {
+    std::unique_lock<std::mutex> lock(mtx);
+    requesting = true;
+    sequence_number++;
+    LN[id] = sequence_number;
+    
+    std::cout << "Process " << id << " requesting CS with SN: " << sequence_number << std::endl;
+    
+    // Broadcast request to all other processes
+    Message msg;
+    msg.type = REQUEST;
+    msg.sender_id = id;
+    msg.sequence_number = sequence_number;
+    
+    for (int i = 0; i < NUM_PROCESSES; i++) {
+        if (i != id && client_sockets[i] != -1) {
+            write(client_sockets[i], &msg, sizeof(msg));
         }
     }
-    updateState(IDLE);
+    
+    // Wait for token
+    cv.wait(lock, [this]() { return has_token; });
 }
 
-void Process::recevoirMessage(const Message& msg) {
-    if (enPanne) return;
-    horlogeLogique = max(horlogeLogique.load(), msg.clock) + 1;
-
-    if (msg.type == REQUEST) {
-        requetes[msg.sender] = max(requetes[msg.sender], msg.clock);
-        if (jetonPresent && !dansSC) {
-            if (requetes[msg.sender] > jeton->lastRequestClock[msg.sender]) {
-                Message tokenMsg{TOKEN, id, horlogeLogique, jeton->lastRequestClock};
-                envoyerMessage(msg.sender, tokenMsg);
-                jetonPresent = false;
-                updateState(IDLE);
-            }
-        }
-    } else if (msg.type == TOKEN) {
-        if (!jeton) jeton = new Token(NUM_PROCESS);
-        jeton->lastRequestClock = msg.token;
-        jetonPresent = true;
-        tokenCV.notify_one();
-    }
-}
-
-void Process::envoyerMessage(int targetId, const Message& msg) {
-    lock_guard<mutex> lock(socketMutex);
-    if (clientSockets.find(targetId) == clientSockets.end()) return;
-
-    json j;
-    j["type"] = msg.type;
-    j["sender"] = msg.sender;
-    j["clock"] = msg.clock;
-    j["token"] = msg.token;
-
-    string serialized = j.dump();
-    send(clientSockets[targetId], serialized.c_str(), serialized.size(), 0);
-}
-
-void Process::broadcastMessage(const Message& msg) {
-    for (int i = 0; i < NUM_PROCESS; ++i) {
-        if (i != id && !enPanne) {
-            envoyerMessage(i, msg);
+void Process::release_critical_section() {
+    std::unique_lock<std::mutex> lock(mtx);
+    RN[id] = LN[id];
+    requesting = false;
+    
+    // Check if there are pending requests
+    for (int i = 0; i < NUM_PROCESSES; i++) {
+        if (RN[i] == LN[i] - 1 && i != id) {
+            send_token(i);
+            break;
         }
     }
+    
+    std::cout << "Process " << id << " released CS" << std::endl;
 }
 
-int Process::getRandomDelay(int minMs, int maxMs) {
-    return minMs + rand() % (maxMs - minMs + 1);
-}
-
-void Process::updateState(ProcessState newState) {
-    state = newState;
-    notifyStateChange();
-}
-
-void Process::notifyStateChange() {
-    if (ws_server) {
-        ws_server->broadcast_process_state(id, 
-            state == IDLE ? "idle" : state == REQUESTING ? "requesting" : state == IN_CS ? "in_cs" : "failed", 
-            requetes);
-    }
-}
-
-void Process::setWebSocketServer(WebSocketServer* server) {
-    ws_server = server;
-}
-
-void Process::runServer() {
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(getProcessPort(id));
-
-    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        cerr << "Bind failed\n";
-        exit(1);
-    }
-
-    listen(serverSocket, NUM_PROCESS);
-    cout << "[P" << id << "] Listening on port " << getProcessPort(id) << endl;
-
-    while (!enPanne) {
-        sockaddr_in clientAddr;
-        socklen_t len = sizeof(clientAddr);
-        int clientSocket = accept(serverSocket, (sockaddr*)&clientAddr, &len);
-        if (clientSocket >= 0) {
-            thread(&Process::handleClient, this, clientSocket).detach();
-        }
-    }
-}
-
-void Process::connectToPeers() {
-    for (int i = 0; i < NUM_PROCESS; ++i) {
-        if (i == id) continue;
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(getProcessPort(i));
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-        while (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            this_thread::sleep_for(chrono::milliseconds(100));
-        }
-
-        lock_guard<mutex> lock(socketMutex);
-        clientSockets[i] = sock;
-    }
-}
-
-void Process::handleClient(int clientSocket) {
-    char buffer[4096];
-    while (!enPanne) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (bytes <= 0) break;
-
-        try {
-            json j = json::parse(string(buffer, bytes));
-            Message msg;
-            msg.type = static_cast<MessageType>(j["type"].get<int>());
-            msg.sender = j["sender"].get<int>();
-            msg.clock = j["clock"].get<int>();
-            msg.token = j["token"].get<vector<int>>();
-
-            recevoirMessage(msg);
-        } catch (...) {
-            cerr << "[P" << id << "] Failed to parse message" << endl;
-        }
-    }
-    close(clientSocket);
+void Process::critical_section() {
+    std::cout << "Process " << id << " entering critical section" << std::endl;
+    // Simulate work in critical section
+    sleep(1 + rand() % 3);
+    std::cout << "Process " << id << " exiting critical section" << std::endl;
 }
